@@ -22,6 +22,7 @@ use futures_util::StreamExt;
 use log::{LevelFilter, Log, Metadata, Record};
 use reqwest::Client;
 use serde_json::{json, Map, Value};
+use std::process::{Child, Command, Stdio};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -100,6 +101,157 @@ fn init_logger(log_file: &str) {
         log::set_boxed_logger(Box::new(logger)).expect("failed to install logger");
         log::set_max_level(LevelFilter::Error);
     });
+}
+
+fn build_config() -> Config {
+    Config {
+        responses_url: std::env::var("OPENAI_API_URL").unwrap_or_default(),
+        openai_key: std::env::var("OPENAI_API_KEY").unwrap_or_default(),
+        model: std::env::var("OPENAI_API_MODEL").unwrap_or_default(),
+        host: std::env::var("CC_OAI_PROXY_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
+        port: std::env::var("CC_OAI_PROXY_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5520),
+        log_file: std::env::var("CC_OAI_PROXY_LOG_FILE")
+            .unwrap_or_else(|_| "cc_oai_proxy.log".to_string()),
+        min_max_output_tokens: std::env::var("CC_OAI_PROXY_MIN_MAX_OUTPUT_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8192),
+        fallback_max_output_tokens: std::env::var("CC_OAI_PROXY_FALLBACK_MAX_OUTPUT_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8192),
+    }
+}
+
+fn build_app(state: AppState) -> Router {
+    Router::new()
+        .route("/v1/messages", post(proxy_messages))
+        .route("/v1/models", get(list_models))
+        .route("/v1/health", get(health))
+        .with_state(state)
+}
+
+async fn run_proxy_server(config: Config) -> Result<(), std::io::Error> {
+    let client = Client::builder()
+        .build()
+        .expect("failed to build reqwest client");
+    let state = AppState {
+        client,
+        config: config.clone(),
+    };
+    let app = build_app(state);
+    let addr: SocketAddr = format!("{}:{}", config.host, config.port)
+        .parse()
+        .expect("invalid host/port");
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("bind failed");
+    axum::serve(listener, app).await
+}
+
+async fn wait_for_proxy_ready(base_url: &str, proxy_child: &mut Child) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|e| format!("failed to create readiness client: {}", e))?;
+    let health_url = format!("{}/v1/health", base_url.trim_end_matches('/'));
+    for _ in 0..100 {
+        if let Ok(Some(status)) = proxy_child.try_wait() {
+            return Err(format!("proxy child exited early with status {}", status));
+        }
+        match client.get(&health_url).send().await {
+            Ok(resp) if resp.status().is_success() => return Ok(()),
+            _ => {}
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(format!("proxy did not become ready at {}", health_url))
+}
+
+fn spawn_proxy_child() -> Result<Child, String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("failed to resolve current executable: {}", e))?;
+    let config = build_config();
+    Command::new(exe)
+        .arg("proxy")
+        .env("CC_OAI_PROXY_HOST", &config.host)
+        .env("CC_OAI_PROXY_PORT", config.port.to_string())
+        .env("OPENAI_API_URL", &config.responses_url)
+        .env("OPENAI_API_KEY", &config.openai_key)
+        .env("OPENAI_API_MODEL", &config.model)
+        .env("CC_OAI_PROXY_LOG_FILE", &config.log_file)
+        .env(
+            "CC_OAI_PROXY_MIN_MAX_OUTPUT_TOKENS",
+            config.min_max_output_tokens.to_string(),
+        )
+        .env(
+            "CC_OAI_PROXY_FALLBACK_MAX_OUTPUT_TOKENS",
+            config.fallback_max_output_tokens.to_string(),
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("failed to start proxy child: {}", e))
+}
+
+async fn launch_claude_mode(config: Config, claude_args: Vec<String>) -> Result<(), String> {
+    let base_url = format!("http://{}:{}", config.host, config.port);
+    let mut proxy_child = spawn_proxy_child()?;
+    if let Err(err) = wait_for_proxy_ready(&base_url, &mut proxy_child).await {
+        let _ = proxy_child.kill();
+        let _ = proxy_child.wait();
+        return Err(err);
+    }
+
+    let force_bare = !claude_args.iter().any(|arg| arg == "--bare");
+    let mut child = Command::new("claude");
+    if force_bare {
+        child.arg("--bare");
+    }
+    child.args(claude_args);
+    child.env("ANTHROPIC_BASE_URL", &base_url);
+    child.env(
+        "ANTHROPIC_API_KEY",
+        std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| "cc_oai_proxy".to_string()),
+    );
+    child.env("CLAUDE_CODE_SIMPLE", "1");
+    child.stdin(Stdio::inherit());
+    child.stdout(Stdio::inherit());
+    child.stderr(Stdio::inherit());
+
+    let child = child
+        .spawn()
+        .map_err(|e| format!("failed to start claude: {}", e));
+    let mut child = match child {
+        Ok(child) => child,
+        Err(err) => {
+            let _ = proxy_child.kill();
+            let _ = proxy_child.wait();
+            return Err(err);
+        }
+    };
+
+    let child_status = tokio::task::spawn_blocking(move || {
+        child
+            .wait()
+            .map_err(|e| format!("failed to wait claude: {}", e))
+    })
+    .await
+    .map_err(|e| format!("claude wait task join error: {}", e))??;
+
+    let _ = proxy_child.kill();
+    let _ = tokio::task::spawn_blocking(move || proxy_child.wait())
+        .await
+        .map_err(|e| format!("proxy wait task join error: {}", e));
+
+    if !child_status.success() {
+        return Err(format!("claude exited with status {}", child_status));
+    }
+
+    Ok(())
 }
 
 fn truncate(text: &str, limit: usize) -> String {
@@ -821,51 +973,41 @@ async fn health() -> impl IntoResponse {
 
 #[tokio::main]
 async fn main() {
-    let config = Config {
-        responses_url: std::env::var("OPENAI_API_URL").unwrap_or_default(),
-        openai_key: std::env::var("OPENAI_API_KEY").unwrap_or_default(),
-        model: std::env::var("OPENAI_API_MODEL").unwrap_or_default(),
-        host: std::env::var("CC_OAI_PROXY_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
-        port: std::env::var("CC_OAI_PROXY_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(5520),
-        log_file: std::env::var("CC_OAI_PROXY_LOG_FILE")
-            .unwrap_or_else(|_| "cc_oai_proxy.log".to_string()),
-        min_max_output_tokens: std::env::var("CC_OAI_PROXY_MIN_MAX_OUTPUT_TOKENS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8192),
-        fallback_max_output_tokens: std::env::var("CC_OAI_PROXY_FALLBACK_MAX_OUTPUT_TOKENS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8192),
-    };
+    let mut args = std::env::args().skip(1);
+    let first_arg = args.next();
+    let config = build_config();
 
     if config.openai_key.is_empty() {
-        panic!("请在环境变量中设置 OPENAI_API_KEY");
+        panic!("Please set OPENAI_API_KEY in the environment");
     }
     init_logger(&config.log_file);
 
-    let client = Client::builder()
-        .build()
-        .expect("failed to build reqwest client");
-    let state = AppState {
-        client,
-        config: config.clone(),
-    };
-
-    let app = Router::new()
-        .route("/v1/messages", post(proxy_messages))
-        .route("/v1/models", get(list_models))
-        .route("/v1/health", get(health))
-        .with_state(state);
-
-    let addr: SocketAddr = format!("{}:{}", config.host, config.port)
-        .parse()
-        .expect("invalid host/port");
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .expect("bind failed");
-    axum::serve(listener, app).await.expect("server failed");
+    match first_arg.as_deref() {
+        Some("claude") => {
+            let claude_args: Vec<String> = args.collect();
+            if let Err(err) = launch_claude_mode(config, claude_args).await {
+                eprintln!("{}", err);
+                std::process::exit(1);
+            }
+        }
+        Some("proxy") => {
+            if let Err(err) = run_proxy_server(config).await {
+                eprintln!("proxy server error: {}", err);
+                std::process::exit(1);
+            }
+        }
+        Some(other) => {
+            eprintln!(
+                "Unknown mode '{}'. Use no arguments for proxy mode, 'proxy' for proxy-only mode, or 'claude' for launcher mode.",
+                other
+            );
+            std::process::exit(2);
+        }
+        None => {
+            if let Err(err) = run_proxy_server(config).await {
+                eprintln!("proxy server error: {}", err);
+                std::process::exit(1);
+            }
+        }
+    }
 }
