@@ -28,7 +28,7 @@ use uuid::Uuid;
 struct Config {
     responses_url: String,
     openai_key: String,
-    openai_deployment: String,
+    model: String,
     host: String,
     port: u16,
     log_file: String,
@@ -308,7 +308,7 @@ fn anthropic_messages_to_responses_input(messages: &[Value]) -> Vec<Value> {
 
 fn upstream_error_detail(status: StatusCode, body: &str, req_body: &Value) -> Value {
     json!({
-        "message": "Upstream Azure request failed",
+        "message": "Upstream OpenAI request failed",
         "upstream_status": status.as_u16(),
         "upstream_detail": truncate(body, 2000),
         "request_model": req_body.get("model"),
@@ -442,13 +442,14 @@ impl StreamStateForResponses {
             let item = event.get("item").cloned().unwrap_or_else(|| json!({}));
             let cache_id = item_id
                 .or_else(|| item.get("id").and_then(|v| v.as_str()))
-                .or_else(|| item.get("call_id").and_then(|v| v.as_str()));
+                .or_else(|| item.get("call_id").and_then(|v| v.as_str()))
+                .map(|s| s.to_string());
             if let Some(cache_id) = cache_id {
-                self.items_by_id.insert(cache_id.to_string(), item.clone());
-                if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
-                    self.tool_args_by_item_id
-                        .entry(cache_id.to_string())
-                        .or_default();
+                let is_function_call =
+                    item.get("type").and_then(|v| v.as_str()) == Some("function_call");
+                self.items_by_id.insert(cache_id.clone(), item);
+                if is_function_call {
+                    self.tool_args_by_item_id.entry(cache_id).or_default();
                 }
             }
         } else if event_type == "response.output_text.delta" {
@@ -633,10 +634,7 @@ async fn proxy_messages(State(state): State<AppState>, body: String) -> impl Int
     let input_payload = anthropic_messages_to_responses_input(&messages);
     let mut responses_body = Map::new();
     responses_body.insert("input".into(), Value::Array(input_payload));
-    responses_body.insert(
-        "model".into(),
-        Value::String(state.config.openai_deployment.clone()),
-    );
+    responses_body.insert("model".into(), Value::String(state.config.model.clone()));
     responses_body.insert("max_output_tokens".into(), Value::from(max_tokens));
     responses_body.insert("stream".into(), Value::Bool(stream));
     if let Some(sys) = &system_prompt {
@@ -684,7 +682,7 @@ async fn proxy_messages(State(state): State<AppState>, body: String) -> impl Int
                             "type": "error",
                             "error": {
                                 "type": "api_error",
-                                "message": truncate(&format!("Azure request failed: {}", err), 2000),
+                                "message": truncate(&format!("OpenAI request failed: {}", err), 2000),
                             }
                         })
                     ));
@@ -702,14 +700,13 @@ async fn proxy_messages(State(state): State<AppState>, body: String) -> impl Int
                         "type": "error",
                         "error": {
                             "type": "api_error",
-                            "message": truncate(&format!("Azure error {}: {}", status, text), 2000),
+                            "message": truncate(&format!("OpenAI error {}: {}", status, text), 2000),
                         }
                     })
                 ));
                 return;
             }
 
-            let message_id = message_id.clone();
             let mut stream_state = StreamStateForResponses::default();
             let mut buf = String::new();
             let mut bytes = resp.bytes_stream();
@@ -727,13 +724,8 @@ async fn proxy_messages(State(state): State<AppState>, body: String) -> impl Int
                 };
                 buf.push_str(&String::from_utf8_lossy(&chunk));
                 while let Some(pos) = buf.find('\n') {
-                    let mut line = buf.drain(..=pos).collect::<String>();
-                    if line.ends_with('\n') {
-                        line.pop();
-                    }
-                    if line.ends_with('\r') {
-                        line.pop();
-                    }
+                    let line = buf[..pos].trim_end_matches('\r').to_owned();
+                    buf.drain(..=pos);
                     if line.is_empty() || !line.starts_with("data:") {
                         continue;
                     }
@@ -785,10 +777,10 @@ async fn proxy_messages(State(state): State<AppState>, body: String) -> impl Int
         Err(err) => {
             log::error!("Upstream request failed: {}", err);
             let detail = json!({
-                "message": "Upstream Azure request failed",
+                "message": "Upstream OpenAI request failed",
                 "upstream_status": 500,
                 "upstream_detail": truncate(&err.to_string(), 2000),
-                "request_model": state.config.openai_deployment.clone(),
+                "request_model": state.config.model.clone(),
                 "request_stream": stream,
                 "request_max_output_tokens": max_tokens,
             });
@@ -813,10 +805,10 @@ async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({
         "data": [
             {
-                "id": state.config.openai_deployment.clone(),
+                "id": state.config.model.clone(),
                 "object": "model",
                 "created": 1234567890u64,
-                "owned_by": "azure"
+                "owned_by": "openai"
             }
         ],
         "object": "list"
@@ -832,18 +824,19 @@ async fn main() {
     let config = Config {
         responses_url: std::env::var("OPENAI_API_URL").unwrap_or_default(),
         openai_key: std::env::var("OPENAI_API_KEY").unwrap_or_default(),
-        openai_deployment: std::env::var("OPENAI_API_MODEL").unwrap_or_default(),
-        host: std::env::var("PROXY_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
-        port: std::env::var("PROXY_PORT")
+        model: std::env::var("OPENAI_API_MODEL").unwrap_or_default(),
+        host: std::env::var("CC_OAI_PROXY_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
+        port: std::env::var("CC_OAI_PROXY_PORT")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(8082),
-        log_file: std::env::var("PROXY_LOG_FILE").unwrap_or_else(|_| "proxy.log".to_string()),
-        min_max_output_tokens: std::env::var("MIN_MAX_OUTPUT_TOKENS")
+        log_file: std::env::var("CC_OAI_PROXY_LOG_FILE")
+            .unwrap_or_else(|_| "proxy.log".to_string()),
+        min_max_output_tokens: std::env::var("CC_OAI_PROXY_MIN_MAX_OUTPUT_TOKENS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(8192),
-        fallback_max_output_tokens: std::env::var("FALLBACK_MAX_OUTPUT_TOKENS")
+        fallback_max_output_tokens: std::env::var("CC_OAI_PROXY_FALLBACK_MAX_OUTPUT_TOKENS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(8192),
