@@ -829,9 +829,9 @@ async fn main() {
         port: std::env::var("CC_OAI_PROXY_PORT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(8082),
+            .unwrap_or(5520),
         log_file: std::env::var("CC_OAI_PROXY_LOG_FILE")
-            .unwrap_or_else(|_| "proxy.log".to_string()),
+            .unwrap_or_else(|_| "cc_oai_proxy.log".to_string()),
         min_max_output_tokens: std::env::var("CC_OAI_PROXY_MIN_MAX_OUTPUT_TOKENS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -843,7 +843,7 @@ async fn main() {
     };
 
     if config.openai_key.is_empty() {
-        panic!("Please set OPENAI_API_KEY in the environment");
+        panic!("请在环境变量中设置 OPENAI_API_KEY");
     }
     init_logger(&config.log_file);
 
