@@ -843,7 +843,7 @@ async fn main() {
     };
 
     if config.openai_key.is_empty() {
-        panic!("请在环境变量中设置 OPENAI_API_KEY");
+        panic!("Please set OPENAI_API_KEY in the environment");
     }
     init_logger(&config.log_file);
 
