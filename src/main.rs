@@ -1,7 +1,7 @@
 use std::{
-    collections::HashMap,
-    fs::{File, OpenOptions},
+    collections::{hash_map::Entry, HashMap},
     convert::Infallible,
+    fs::{File, OpenOptions},
     io::Write,
     net::SocketAddr,
     sync::{Mutex, OnceLock},
@@ -34,7 +34,6 @@ struct Config {
     log_file: String,
     min_max_output_tokens: i64,
     fallback_max_output_tokens: i64,
-    log_bodies: bool,
 }
 
 #[derive(Clone)]
@@ -44,13 +43,12 @@ struct AppState {
 }
 
 struct MultiLogger {
-    level: LevelFilter,
     file: Mutex<File>,
 }
 
 impl Log for MultiLogger {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        metadata.level() <= self.level
+        metadata.level() <= LevelFilter::Error
     }
 
     fn log(&self, record: &Record<'_>) {
@@ -58,7 +56,12 @@ impl Log for MultiLogger {
             return;
         }
 
-        let line = format!("{} {:<5} {}", chrono_like_timestamp(), record.level(), record.args());
+        let line = format!(
+            "{} {:<5} {}",
+            chrono_like_timestamp(),
+            record.level(),
+            record.args()
+        );
         eprintln!("{}", line);
         if let Ok(mut file) = self.file.lock() {
             let _ = writeln!(file, "{}", line);
@@ -92,11 +95,10 @@ fn init_logger(log_file: &str) {
             .open(log_file)
             .expect("failed to open log file");
         let logger = MultiLogger {
-            level: LevelFilter::Info,
             file: Mutex::new(file),
         };
         log::set_boxed_logger(Box::new(logger)).expect("failed to install logger");
-        log::set_max_level(LevelFilter::Info);
+        log::set_max_level(LevelFilter::Error);
     });
 }
 
@@ -112,117 +114,110 @@ fn truncate(text: &str, limit: usize) -> String {
     }
 }
 
-fn log_body(label: &str, payload: &Value, enabled: bool) {
-    if !enabled {
-        return;
-    }
-    let text = serde_json::to_string_pretty(payload).unwrap_or_else(|_| payload.to_string());
-    log::info!("{}: {}", label, text);
-}
-
 fn coerce_text(value: &Value) -> Option<String> {
     match value {
         Value::Null => None,
-        Value::String(s) => {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        }
-        Value::Array(items) => {
-            let mut parts = Vec::new();
-            for item in items {
-                match item {
-                    Value::String(s) => {
-                        let trimmed = s.trim();
-                        if !trimmed.is_empty() {
-                            parts.push(trimmed.to_string());
-                        }
-                    }
-                    Value::Object(map) => {
-                        if let Some(Value::String(text)) = map.get("text") {
-                            let trimmed = text.trim();
-                            if !trimmed.is_empty() {
-                                parts.push(trimmed.to_string());
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            let joined = parts.join("\n").trim().to_string();
-            if joined.is_empty() { None } else { Some(joined) }
-        }
+        Value::String(s) => trimmed_owned(s),
+        Value::Array(items) => collect_text_items(items),
         Value::Object(map) => map
             .get("text")
             .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty()),
-        _ => {
-            let s = value.to_string();
-            let trimmed = s.trim().to_string();
-            if trimmed.is_empty() { None } else { Some(trimmed) }
+            .and_then(trimmed_owned),
+        _ => trimmed_owned(&value.to_string()),
+    }
+}
+
+fn trimmed_owned(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
+fn collect_text_items(items: &[Value]) -> Option<String> {
+    let mut parts = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            Value::String(text) => {
+                if let Some(text) = trimmed_owned(text) {
+                    parts.push(text);
+                }
+            }
+            Value::Object(map) => {
+                if let Some(Value::String(text)) = map.get("text") {
+                    if let Some(text) = trimmed_owned(text) {
+                        parts.push(text);
+                    }
+                }
+            }
+            _ => {}
         }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
     }
 }
 
 fn format_tool_block(block: &Map<String, Value>) -> Option<String> {
     match block.get("type").and_then(|v| v.as_str()) {
         Some("tool_use") => {
-            let name = block
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("tool");
+            let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
             let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            let input = block.get("input").cloned().unwrap_or(Value::Object(Map::new()));
+            let input = block
+                .get("input")
+                .cloned()
+                .unwrap_or(Value::Object(Map::new()));
             let input_text = serde_json::to_string(&input).unwrap_or_else(|_| input.to_string());
             Some(format!("[tool_use name={} id={}] {}", name, id, input_text))
         }
         Some("tool_result") => {
-            let tool_use_id = block.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
+            let tool_use_id = block
+                .get("tool_use_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let is_error = block
                 .get("is_error")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             let content = block.get("content").cloned().unwrap_or(Value::Null);
             let content_text = match content {
-                Value::Array(items) => {
-                    let mut parts = Vec::new();
-                    for item in items {
-                        if let Some(text) = coerce_text(&item) {
-                            parts.push(text);
-                        }
-                    }
-                    parts.join("\n")
-                }
+                Value::Array(items) => collect_text_items(&items).unwrap_or_default(),
                 other => coerce_text(&other).unwrap_or_default(),
             };
-            Some(
-                format!(
-                    "[tool_result tool_use_id={} is_error={}] {}",
-                    tool_use_id, is_error, content_text
-                )
-                .trim()
-                .to_string(),
-            )
+            let mut rendered = format!(
+                "[tool_result tool_use_id={} is_error={}]",
+                tool_use_id, is_error
+            );
+            if !content_text.is_empty() {
+                rendered.push(' ');
+                rendered.push_str(&content_text);
+            }
+            Some(rendered)
         }
-        Some("text") => block.get("text").and_then(coerce_text),
+        Some("text") => block
+            .get("text")
+            .and_then(|v| v.as_str())
+            .and_then(trimmed_owned),
         _ => None,
     }
 }
 
 fn normalize_tools(tools: Option<&Value>) -> Option<Vec<Value>> {
     let tools = tools?.as_array()?;
-    let mut normalized = Vec::new();
+    let mut normalized = Vec::with_capacity(tools.len());
 
     for tool in tools {
         let Some(obj) = tool.as_object() else {
             continue;
         };
 
-        if obj.get("type").and_then(|v| v.as_str()) == Some("function") && obj.contains_key("name") {
+        if obj.get("type").and_then(|v| v.as_str()) == Some("function") && obj.contains_key("name")
+        {
             normalized.push(Value::Object(obj.clone()));
             continue;
         }
@@ -263,7 +258,7 @@ fn normalize_tools(tools: Option<&Value>) -> Option<Vec<Value>> {
 }
 
 fn anthropic_messages_to_responses_input(messages: &[Value]) -> Vec<Value> {
-    let mut input_payload = Vec::new();
+    let mut input_payload = Vec::with_capacity(messages.len());
     for msg in messages {
         let Some(obj) = msg.as_object() else {
             continue;
@@ -273,7 +268,7 @@ fn anthropic_messages_to_responses_input(messages: &[Value]) -> Vec<Value> {
         let content = obj.get("content").cloned().unwrap_or(Value::Null);
 
         let text = if let Value::Array(blocks) = content {
-            let mut parts = Vec::new();
+            let mut parts = Vec::with_capacity(blocks.len());
             for block in blocks {
                 if let Some(block_obj) = block.as_object() {
                     if let Some(rendered) = format_tool_block(block_obj) {
@@ -329,7 +324,8 @@ fn convert_responses_non_streaming(response_json: &Value, model_id: &str) -> Val
             if item.get("type").and_then(|v| v.as_str()) == Some("message") {
                 if let Some(content_items) = item.get("content").and_then(|v| v.as_array()) {
                     for content_item in content_items {
-                        if content_item.get("type").and_then(|v| v.as_str()) == Some("output_text") {
+                        if content_item.get("type").and_then(|v| v.as_str()) == Some("output_text")
+                        {
                             if let Some(text) = content_item.get("text").and_then(|v| v.as_str()) {
                                 text_content.push_str(text);
                             }
@@ -340,9 +336,18 @@ fn convert_responses_non_streaming(response_json: &Value, model_id: &str) -> Val
         }
     }
 
-    let usage = response_json.get("usage").cloned().unwrap_or_else(|| json!({}));
-    let input_tokens = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-    let output_tokens = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+    let usage = response_json
+        .get("usage")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let input_tokens = usage
+        .get("input_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("output_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
 
     json!({
         "id": format!("msg_{}", Uuid::new_v4().simple()),
@@ -363,7 +368,7 @@ fn convert_responses_non_streaming(response_json: &Value, model_id: &str) -> Val
 struct StreamStateForResponses {
     started: bool,
     next_content_block_index: usize,
-    blocks_by_item_id: HashMap<String, (usize, String)>,
+    blocks_by_item_id: HashMap<String, usize>,
     items_by_id: HashMap<String, Value>,
     tool_args_by_item_id: HashMap<String, String>,
     seen_tool_use: bool,
@@ -371,14 +376,23 @@ struct StreamStateForResponses {
 }
 
 impl StreamStateForResponses {
+    fn reserve_block_index(&mut self, item_id: &str) -> (usize, bool) {
+        match self.blocks_by_item_id.entry(item_id.to_owned()) {
+            Entry::Occupied(entry) => (*entry.get(), false),
+            Entry::Vacant(entry) => {
+                let block_index = self.next_content_block_index;
+                self.next_content_block_index += 1;
+                entry.insert(block_index);
+                (block_index, true)
+            }
+        }
+    }
+
     fn start_text_block(&mut self, item_id: &str) -> Vec<String> {
-        if self.blocks_by_item_id.contains_key(item_id) {
+        let (block_index, inserted) = self.reserve_block_index(item_id);
+        if !inserted {
             return Vec::new();
         }
-        let block_index = self.next_content_block_index;
-        self.next_content_block_index += 1;
-        self.blocks_by_item_id
-            .insert(item_id.to_string(), (block_index, "text".into()));
         let block_start = json!({
             "type": "content_block_start",
             "index": block_index,
@@ -388,7 +402,7 @@ impl StreamStateForResponses {
     }
 
     fn stop_block(&mut self, item_id: &str) -> Vec<String> {
-        let Some((index, _)) = self.blocks_by_item_id.remove(item_id) else {
+        let Some(index) = self.blocks_by_item_id.remove(item_id) else {
             return Vec::new();
         };
         let block_stop = json!({
@@ -398,7 +412,12 @@ impl StreamStateForResponses {
         vec![format!("event: content_block_stop\ndata: {}", block_stop)]
     }
 
-    fn process_responses_event(&mut self, event: &Value, model: &str, message_id: &str) -> Vec<String> {
+    fn process_responses_event(
+        &mut self,
+        event: &Value,
+        model: &str,
+        message_id: &str,
+    ) -> Vec<String> {
         let mut events = Vec::new();
         let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let item_id = event.get("item_id").and_then(|v| v.as_str());
@@ -429,7 +448,7 @@ impl StreamStateForResponses {
                 if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
                     self.tool_args_by_item_id
                         .entry(cache_id.to_string())
-                        .or_insert_with(String::new);
+                        .or_default();
                 }
             }
         } else if event_type == "response.output_text.delta" {
@@ -443,13 +462,16 @@ impl StreamStateForResponses {
             events.extend(self.start_text_block(item_id));
             if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
                 if !delta.is_empty() {
-                    let index = self.blocks_by_item_id.get(item_id).map(|(i, _)| *i).unwrap_or(0);
+                    let index = self.blocks_by_item_id.get(item_id).copied().unwrap_or(0);
                     let content_delta = json!({
                         "type": "content_block_delta",
                         "index": index,
                         "delta": {"type": "text_delta", "text": delta}
                     });
-                    events.push(format!("event: content_block_delta\ndata: {}", content_delta));
+                    events.push(format!(
+                        "event: content_block_delta\ndata: {}",
+                        content_delta
+                    ));
                 }
             }
         } else if event_type == "response.function_call_arguments.delta" {
@@ -463,11 +485,20 @@ impl StreamStateForResponses {
                     }
                 }
             }
-        } else if event_type == "response.output_text.done" || event_type == "response.function_call_arguments.done" {
+        } else if event_type == "response.output_text.done"
+            || event_type == "response.function_call_arguments.done"
+        {
             if event_type == "response.function_call_arguments.done" {
                 if let Some(item_id) = item_id {
-                    let item = self.items_by_id.get(item_id).cloned().unwrap_or_else(|| json!({}));
-                    let tool_name = item.get("name").and_then(|v| v.as_str()).map(|s| s.trim().to_string());
+                    let item = self
+                        .items_by_id
+                        .get(item_id)
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    let tool_name = item
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .and_then(trimmed_owned);
                     let tool_id = item
                         .get("call_id")
                         .and_then(|v| v.as_str())
@@ -481,41 +512,32 @@ impl StreamStateForResponses {
                         .unwrap_or_default();
 
                     if let Some(tool_name) = tool_name {
-                        if !tool_name.is_empty() {
-                            let block_index = if let Some((index, _)) = self.blocks_by_item_id.get(item_id) {
-                                *index
-                            } else {
-                                let idx = self.next_content_block_index;
-                                self.next_content_block_index += 1;
-                                self.blocks_by_item_id
-                                    .insert(item_id.to_string(), (idx, "tool_use".into()));
-                                idx
-                            };
+                        let block_index = self.reserve_block_index(item_id).0;
 
-                            let block_start = json!({
-                                "type": "content_block_start",
+                        let block_start = json!({
+                            "type": "content_block_start",
+                            "index": block_index,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": tool_id,
+                                "name": tool_name,
+                            }
+                        });
+                        events.push(format!("event: content_block_start\ndata: {}", block_start));
+                        if !args_text.is_empty() {
+                            let block_delta = json!({
+                                "type": "content_block_delta",
                                 "index": block_index,
-                                "content_block": {
-                                    "type": "tool_use",
-                                    "id": tool_id,
-                                    "name": tool_name,
+                                "delta": {
+                                    "type": "input_json_delta",
+                                    "partial_json": args_text,
                                 }
                             });
-                            events.push(format!("event: content_block_start\ndata: {}", block_start));
-                            if !args_text.is_empty() {
-                                let block_delta = json!({
-                                    "type": "content_block_delta",
-                                    "index": block_index,
-                                    "delta": {
-                                        "type": "input_json_delta",
-                                        "partial_json": args_text,
-                                    }
-                                });
-                                events.push(format!("event: content_block_delta\ndata: {}", block_delta));
-                            }
-                            self.seen_tool_use = true;
-                            events.extend(self.stop_block(item_id));
+                            events
+                                .push(format!("event: content_block_delta\ndata: {}", block_delta));
                         }
+                        self.seen_tool_use = true;
+                        events.extend(self.stop_block(item_id));
                     }
                     self.tool_args_by_item_id.remove(item_id);
                 }
@@ -541,7 +563,11 @@ impl StreamStateForResponses {
                 .and_then(|u| u.get("output_tokens"))
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
-            let stop_reason = if self.seen_tool_use { "tool_use" } else { "end_turn" };
+            let stop_reason = if self.seen_tool_use {
+                "tool_use"
+            } else {
+                "end_turn"
+            };
             let msg_delta = json!({
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason, "stop_sequence": Value::Null},
@@ -563,23 +589,21 @@ async fn proxy_messages(State(state): State<AppState>, body: String) -> impl Int
                 "message": "Invalid JSON",
                 "body_preview": truncate(&body, 2000),
             });
-            log::warn!("Invalid JSON received: {}", truncate(&body, 500));
+            log::error!("Invalid JSON received: {}", truncate(&body, 500));
             return (StatusCode::BAD_REQUEST, Json(json!({"detail": detail}))).into_response();
         }
     };
-
-    log_body("Incoming request body", &body_value, state.config.log_bodies);
 
     let model_alias = body_value
         .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or("claude")
         .to_string();
-    let messages = body_value
+    let messages: &[Value] = body_value
         .get("messages")
         .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
     let system_prompt = body_value
         .get("system")
         .and_then(coerce_text)
@@ -595,23 +619,14 @@ async fn proxy_messages(State(state): State<AppState>, body: String) -> impl Int
     let tools = normalize_tools(body_value.get("tools"));
     let tool_choice = body_value.get("tool_choice").cloned();
     let parallel_tool_calls = body_value.get("parallel_tool_calls").cloned();
-    let output_config = body_value
+    let reasoning_effort = body_value
         .get("output_config")
         .and_then(|v| v.as_object())
-        .cloned()
-        .unwrap_or_default();
-    let reasoning_effort = output_config
-        .get("effort")
+        .and_then(|obj| obj.get("effort"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
     if max_tokens < state.config.min_max_output_tokens {
-        log::warn!(
-            "max_tokens={} below minimum {}; falling back to {}",
-            max_tokens,
-            state.config.min_max_output_tokens,
-            state.config.fallback_max_output_tokens
-        );
         max_tokens = state.config.fallback_max_output_tokens;
     }
 
@@ -644,18 +659,6 @@ async fn proxy_messages(State(state): State<AppState>, body: String) -> impl Int
     }
 
     let responses_body_value = Value::Object(responses_body);
-    log::info!(
-        "Incoming request: model={} stream={} max_tokens={} messages={}",
-        model_alias,
-        stream,
-        max_tokens,
-        messages.len()
-    );
-    log::info!(
-        "Transformed upstream body: {}",
-        truncate(&responses_body_value.to_string(), 2000)
-    );
-
     if stream {
         let message_id = format!("msg_{}", Uuid::new_v4().simple());
         let config = state.config.clone();
@@ -706,7 +709,6 @@ async fn proxy_messages(State(state): State<AppState>, body: String) -> impl Int
                 return;
             }
 
-            log::info!("Upstream stream connected: status={}", status);
             let message_id = message_id.clone();
             let mut stream_state = StreamStateForResponses::default();
             let mut buf = String::new();
@@ -736,7 +738,6 @@ async fn proxy_messages(State(state): State<AppState>, body: String) -> impl Int
                         continue;
                     }
                     let data_str = line[5..].trim().to_string();
-                    log::info!("Upstream stream event: {}", truncate(&data_str, 2000));
                     if data_str == "[DONE]" {
                         done = true;
                         break;
@@ -747,14 +748,14 @@ async fn proxy_messages(State(state): State<AppState>, body: String) -> impl Int
                     let anthropic_events =
                         stream_state.process_responses_event(&event, &model_alias_clone, &message_id);
                     for ae in anthropic_events {
-                        log::info!("Proxy stream event: {}", ae);
                         yield Bytes::from(format!("{}\n\n", ae));
                     }
                 }
             }
         };
 
-        let mut response = Response::new(Body::from_stream(stream_body.map(Ok::<Bytes, Infallible>)));
+        let mut response =
+            Response::new(Body::from_stream(stream_body.map(Ok::<Bytes, Infallible>)));
         response.headers_mut().insert(
             axum::http::header::CONTENT_TYPE,
             HeaderValue::from_static("text/event-stream"),
@@ -797,14 +798,12 @@ async fn proxy_messages(State(state): State<AppState>, body: String) -> impl Int
 
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
-    log::info!("Upstream response status={} body={}", status, truncate(&text, 2000));
     if status != StatusCode::OK {
         let detail = upstream_error_detail(status, &text, &responses_body_value);
         log::error!("Upstream error: {}", detail);
         return (status, Json(json!({"detail": detail}))).into_response();
     }
 
-    log::info!("Upstream request succeeded: status={}", status);
     let response_json: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({}));
     let anthropic_resp = convert_responses_non_streaming(&response_json, &model_alias);
     Json(anthropic_resp).into_response()
@@ -828,7 +827,6 @@ async fn health() -> impl IntoResponse {
     Json(json!({"status": "ok"}))
 }
 
-
 #[tokio::main]
 async fn main() {
     let config = Config {
@@ -849,7 +847,6 @@ async fn main() {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(8192),
-        log_bodies: std::env::var("PROXY_LOG_BODIES").map(|v| v != "0").unwrap_or(true),
     };
 
     if config.openai_key.is_empty() {
@@ -874,10 +871,6 @@ async fn main() {
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
         .parse()
         .expect("invalid host/port");
-    println!(
-        "代理启动: {}:{} → {} (模型部署: {})",
-        config.host, config.port, config.responses_url, config.openai_deployment
-    );
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("bind failed");
