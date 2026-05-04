@@ -1,11 +1,5 @@
 # Claude Code OpenAI Proxy
 
-
-
-https://github.com/user-attachments/assets/765e59d8-ec46-488d-b810-84d80dd787cf
-
-
-
 Use `ccctl claude` to connect Claude to an OpenAI Responses API backend.
 
 `ccctl` is a small Rust binary that lets Claude Code client talk to an OpenAI Responses API backend.
