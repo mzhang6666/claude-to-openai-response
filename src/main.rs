@@ -105,21 +105,21 @@ fn init_logger(log_file: &str) {
 
 fn build_config() -> Config {
     Config {
-        responses_url: std::env::var("OPENAI_API_URL").unwrap_or_default(),
+        responses_url: std::env::var("OPENAI_BASE_URL").unwrap_or_default(),
         openai_key: std::env::var("OPENAI_API_KEY").unwrap_or_default(),
-        model: std::env::var("OPENAI_API_MODEL").unwrap_or_default(),
-        host: std::env::var("CC_OAI_PROXY_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
-        port: std::env::var("CC_OAI_PROXY_PORT")
+        model: std::env::var("OPENAI_MODEL_NAME").unwrap_or_default(),
+        host: std::env::var("CCP_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
+        port: std::env::var("CCP_PORT")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(5520),
-        log_file: std::env::var("CC_OAI_PROXY_LOG_FILE")
-            .unwrap_or_else(|_| "cc_oai_proxy.log".to_string()),
-        min_max_output_tokens: std::env::var("CC_OAI_PROXY_MIN_MAX_OUTPUT_TOKENS")
+        log_file: std::env::var("CCP_LOG_PATH")
+            .unwrap_or_else(|_| "ccp.log".to_string()),
+        min_max_output_tokens: std::env::var("CCP_MIN_MAX_OUTPUT_TOKENS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(8192),
-        fallback_max_output_tokens: std::env::var("CC_OAI_PROXY_FALLBACK_MAX_OUTPUT_TOKENS")
+        fallback_max_output_tokens: std::env::var("CCP_FALLBACK_MAX_OUTPUT_TOKENS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(8192),
