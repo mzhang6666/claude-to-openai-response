@@ -12,7 +12,8 @@ use async_stream::stream;
 use axum::{
     body::Body,
     extract::State,
-    http::{HeaderValue, StatusCode},
+    http::{HeaderValue, Request, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -33,6 +34,7 @@ struct Config {
     host: String,
     port: u16,
     log_file: String,
+    log_level: LevelFilter,
     min_max_output_tokens: i64,
     fallback_max_output_tokens: i64,
 }
@@ -45,11 +47,12 @@ struct AppState {
 
 struct MultiLogger {
     file: Mutex<File>,
+    max_level: LevelFilter,
 }
 
 impl Log for MultiLogger {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        metadata.level() <= LevelFilter::Error
+        metadata.level() <= self.max_level
     }
 
     fn log(&self, record: &Record<'_>) {
@@ -87,7 +90,14 @@ fn chrono_like_timestamp() -> String {
     format!("{}.{:03}", secs, millis)
 }
 
-fn init_logger(log_file: &str) {
+fn parse_log_level() -> LevelFilter {
+    std::env::var("CCCTL_LOG_LEVEL")
+        .ok()
+        .and_then(|v| v.parse::<LevelFilter>().ok())
+        .unwrap_or(LevelFilter::Error)
+}
+
+fn init_logger(log_file: &str, max_level: LevelFilter) {
     static INIT: OnceLock<()> = OnceLock::new();
     INIT.get_or_init(|| {
         let file = OpenOptions::new()
@@ -97,9 +107,10 @@ fn init_logger(log_file: &str) {
             .expect("failed to open log file");
         let logger = MultiLogger {
             file: Mutex::new(file),
+            max_level,
         };
         log::set_boxed_logger(Box::new(logger)).expect("failed to install logger");
-        log::set_max_level(LevelFilter::Error);
+        log::set_max_level(max_level);
     });
 }
 
@@ -115,6 +126,7 @@ fn build_config() -> Config {
             .unwrap_or(5520),
         log_file: std::env::var("CCCTL_LOG_PATH")
             .unwrap_or_else(|_| "ccctl.log".to_string()),
+        log_level: parse_log_level(),
         min_max_output_tokens: std::env::var("CCCTL_MIN_MAX_OUTPUT_TOKENS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -128,9 +140,11 @@ fn build_config() -> Config {
 
 fn build_app(state: AppState) -> Router {
     Router::new()
+        .route("/", get(root_get).head(root_head))
         .route("/v1/messages", post(proxy_messages))
         .route("/v1/models", get(list_models))
         .route("/v1/health", get(health))
+        .layer(middleware::from_fn(log_http_request))
         .with_state(state)
 }
 
@@ -264,6 +278,61 @@ fn truncate(text: &str, limit: usize) -> String {
     } else {
         format!("{}...<truncated>", out)
     }
+}
+
+fn log_request_summary(
+    model_alias: &str,
+    messages_len: usize,
+    system_prompt_present: bool,
+    tools_count: usize,
+    max_tokens: i64,
+    stream: bool,
+    reasoning_effort: Option<&str>,
+    top_p_present: bool,
+) {
+    log::info!(
+        "proxy request model={} messages={} system={} tools={} max_tokens={} stream={} reasoning={} top_p={}",
+        model_alias,
+        messages_len,
+        system_prompt_present,
+        tools_count,
+        max_tokens,
+        stream,
+        reasoning_effort.unwrap_or("none"),
+        top_p_present,
+    );
+}
+
+fn log_forwarded_request(body: &Value) {
+    let serialized = serde_json::to_string(body).unwrap_or_else(|_| body.to_string());
+    log::info!("openai request body={}", serialized);
+}
+
+fn log_openai_response(status: StatusCode, body: &str) {
+    log::info!("openai response status={} body={}", status, body);
+}
+
+fn log_openai_stream_event(data: &str) {
+    log::info!("openai stream data={}", data);
+}
+
+async fn log_http_request(req: Request<Body>, next: Next) -> Response {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    log::info!("incoming request method={} uri={}", method, uri);
+
+    let started_at = std::time::Instant::now();
+    let response = next.run(req).await;
+
+    log::info!(
+        "completed request method={} uri={} status={} elapsed_ms={}",
+        method,
+        uri,
+        response.status(),
+        started_at.elapsed().as_millis()
+    );
+
+    response
 }
 
 fn coerce_text(value: &Value) -> Option<String> {
@@ -783,6 +852,18 @@ async fn proxy_messages(State(state): State<AppState>, body: String) -> impl Int
         max_tokens = state.config.fallback_max_output_tokens;
     }
 
+    let tools_count = tools.as_ref().map(|v| v.len()).unwrap_or(0);
+    log_request_summary(
+        &model_alias,
+        messages.len(),
+        system_prompt.is_some(),
+        tools_count,
+        max_tokens,
+        stream,
+        reasoning_effort.as_deref(),
+        body_value.get("top_p").is_some(),
+    );
+
     let input_payload = anthropic_messages_to_responses_input(&messages);
     let mut responses_body = Map::new();
     responses_body.insert("input".into(), Value::Array(input_payload));
@@ -809,6 +890,7 @@ async fn proxy_messages(State(state): State<AppState>, body: String) -> impl Int
     }
 
     let responses_body_value = Value::Object(responses_body);
+    log_forwarded_request(&responses_body_value);
     if stream {
         let message_id = format!("msg_{}", Uuid::new_v4().simple());
         let config = state.config.clone();
@@ -845,6 +927,7 @@ async fn proxy_messages(State(state): State<AppState>, body: String) -> impl Int
             let status = resp.status();
             if status != StatusCode::OK {
                 let text = resp.text().await.unwrap_or_default();
+                log_openai_response(status, &text);
                 log::error!("Upstream stream response status={} body={}", status, truncate(&text, 2000));
                 yield Bytes::from(format!(
                     "event: error\ndata: {}\n\n",
@@ -858,6 +941,8 @@ async fn proxy_messages(State(state): State<AppState>, body: String) -> impl Int
                 ));
                 return;
             }
+
+            log::info!("openai response status={} streaming=true", status);
 
             let mut stream_state = StreamStateForResponses::default();
             let mut buf = String::new();
@@ -886,6 +971,7 @@ async fn proxy_messages(State(state): State<AppState>, body: String) -> impl Int
                         done = true;
                         break;
                     }
+                    log_openai_stream_event(&data_str);
                     let Ok(event) = serde_json::from_str::<Value>(&data_str) else {
                         continue;
                     };
@@ -942,6 +1028,7 @@ async fn proxy_messages(State(state): State<AppState>, body: String) -> impl Int
 
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
+    log_openai_response(status, &text);
     if status != StatusCode::OK {
         let detail = upstream_error_detail(status, &text, &responses_body_value);
         log::error!("Upstream error: {}", detail);
@@ -971,6 +1058,114 @@ async fn health() -> impl IntoResponse {
     Json(json!({"status": "ok"}))
 }
 
+async fn root_get() -> impl IntoResponse {
+    Json(json!({"status": "ok"}))
+}
+
+async fn root_head() -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+        axum::http::header::CONTENT_LENGTH,
+        HeaderValue::from_static("0"),
+    );
+    headers.insert(axum::http::header::ALLOW, HeaderValue::from_static("POST"));
+    response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{Method, Request};
+    use tower::ServiceExt;
+
+    fn test_state() -> AppState {
+        AppState {
+            client: Client::builder()
+                .build()
+                .expect("failed to build reqwest client"),
+            config: Config {
+                responses_url: "http://localhost".to_string(),
+                openai_key: "test-key".to_string(),
+                model: "test-model".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: 5520,
+                log_file: "test.log".to_string(),
+                log_level: LevelFilter::Info,
+                min_max_output_tokens: 8192,
+                fallback_max_output_tokens: 8192,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn head_root_returns_method_not_allowed() {
+        let app = build_app(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            response.headers().get(axum::http::header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("application/json"))
+        );
+        assert_eq!(
+            response.headers().get(axum::http::header::CONTENT_LENGTH),
+            Some(&HeaderValue::from_static("0"))
+        );
+        assert_eq!(
+            response.headers().get(axum::http::header::ALLOW),
+            Some(&HeaderValue::from_static("POST"))
+        );
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+            Bytes::new()
+        );
+    }
+
+
+    #[tokio::test]
+    async fn get_root_returns_json() {
+        let app = build_app(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(axum::http::header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("application/json"))
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(body, Bytes::from_static(br#"{"status":"ok"}"#));
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let mut args = std::env::args().skip(1);
@@ -980,7 +1175,7 @@ async fn main() {
     if config.openai_key.is_empty() {
         panic!("Please set OPENAI_API_KEY in the environment");
     }
-    init_logger(&config.log_file);
+    init_logger(&config.log_file, config.log_level);
 
     match first_arg.as_deref() {
         Some("claude") => {

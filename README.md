@@ -91,6 +91,7 @@ The compiled executable will be available at:
 | `CCCTL_HOST` | No | `127.0.0.1` | Bind host for the local proxy |
 | `CCCTL_PORT` | No | `5520` | Bind port for the local proxy |
 | `CCCTL_LOG_PATH` | No | `ccctl.log` | Log file path |
+| `CCCTL_LOG_LEVEL` | No | `info` | Log level, for example `error`, `warn`, `info`, `debug`, or `trace` |
 | `CCCTL_MIN_MAX_OUTPUT_TOKENS` | No | `8192` | Threshold for fallback token handling |
 | `CCCTL_FALLBACK_MAX_OUTPUT_TOKENS` | No | `8192` | Fallback max output tokens value |
 | `ANTHROPIC_API_KEY` | No | `ccp` | Used only in `claude` launcher mode |
@@ -228,6 +229,7 @@ Returns `{"status":"ok"}` for readiness checks.
 ## Logging and Errors
 
 - Logs are written to the file configured by `CCCTL_LOG_PATH`.
+- `CCCTL_LOG_LEVEL` controls whether the request/response `info` logs are emitted.
 - The process exits immediately if `OPENAI_API_KEY` is missing.
 - Upstream failures return detailed error payloads to help with debugging.
 
