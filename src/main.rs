@@ -46,7 +46,8 @@ struct AppState {
 }
 
 struct MultiLogger {
-    file: Mutex<File>,
+    file: Mutex<Option<File>>,
+    log_file: String,
     max_level: LevelFilter,
 }
 
@@ -67,15 +68,34 @@ impl Log for MultiLogger {
             record.args()
         );
         eprintln!("{}", line);
-        if let Ok(mut file) = self.file.lock() {
-            let _ = writeln!(file, "{}", line);
-            let _ = file.flush();
+        if let Ok(mut file_slot) = self.file.lock() {
+            if file_slot.is_none() {
+                match OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.log_file)
+                {
+                    Ok(file) => {
+                        *file_slot = Some(file);
+                    }
+                    Err(_) => {
+                        return;
+                    }
+                }
+            }
+
+            if let Some(file) = file_slot.as_mut() {
+                let _ = writeln!(file, "{}", line);
+                let _ = file.flush();
+            }
         }
     }
 
     fn flush(&self) {
-        if let Ok(mut file) = self.file.lock() {
-            let _ = file.flush();
+        if let Ok(mut file_slot) = self.file.lock() {
+            if let Some(file) = file_slot.as_mut() {
+                let _ = file.flush();
+            }
         }
     }
 }
@@ -94,19 +114,15 @@ fn parse_log_level() -> LevelFilter {
     std::env::var("CCCTL_LOG_LEVEL")
         .ok()
         .and_then(|v| v.parse::<LevelFilter>().ok())
-        .unwrap_or(LevelFilter::Error)
+        .unwrap_or(LevelFilter::Off)
 }
 
 fn init_logger(log_file: &str, max_level: LevelFilter) {
     static INIT: OnceLock<()> = OnceLock::new();
     INIT.get_or_init(|| {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_file)
-            .expect("failed to open log file");
         let logger = MultiLogger {
-            file: Mutex::new(file),
+            file: Mutex::new(None),
+            log_file: log_file.to_string(),
             max_level,
         };
         log::set_boxed_logger(Box::new(logger)).expect("failed to install logger");
@@ -1082,6 +1098,7 @@ async fn root_head() -> Response {
 mod tests {
     use super::*;
     use axum::http::{Method, Request};
+    use log::{Level, Record};
     use tower::ServiceExt;
 
     fn test_state() -> AppState {
@@ -1101,6 +1118,35 @@ mod tests {
                 fallback_max_output_tokens: 8192,
             },
         }
+    }
+
+    #[test]
+    fn logger_does_not_create_file_until_first_log() {
+        let log_file = format!(
+            "{}/ccctl-test-{}.log",
+            std::env::temp_dir().display(),
+            Uuid::new_v4().simple()
+        );
+        let _ = std::fs::remove_file(&log_file);
+
+        let logger = MultiLogger {
+            file: Mutex::new(None),
+            log_file: log_file.clone(),
+            max_level: LevelFilter::Error,
+        };
+
+        assert!(!std::path::Path::new(&log_file).exists());
+
+        let record = Record::builder()
+            .args(format_args!("test log"))
+            .level(Level::Error)
+            .target("tests")
+            .build();
+        logger.log(&record);
+
+        assert!(std::path::Path::new(&log_file).exists());
+
+        let _ = std::fs::remove_file(&log_file);
     }
 
     #[tokio::test]
