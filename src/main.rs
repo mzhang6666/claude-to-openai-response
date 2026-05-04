@@ -108,18 +108,18 @@ fn build_config() -> Config {
         responses_url: std::env::var("OPENAI_BASE_URL").unwrap_or_default(),
         openai_key: std::env::var("OPENAI_API_KEY").unwrap_or_default(),
         model: std::env::var("OPENAI_MODEL_NAME").unwrap_or_default(),
-        host: std::env::var("CCP_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
-        port: std::env::var("CCP_PORT")
+        host: std::env::var("CCCTL_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
+        port: std::env::var("CCCTL_PORT")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(5520),
-        log_file: std::env::var("CCP_LOG_PATH")
-            .unwrap_or_else(|_| "ccp.log".to_string()),
-        min_max_output_tokens: std::env::var("CCP_MIN_MAX_OUTPUT_TOKENS")
+        log_file: std::env::var("CCCTL_LOG_PATH")
+            .unwrap_or_else(|_| "ccctl.log".to_string()),
+        min_max_output_tokens: std::env::var("CCCTL_MIN_MAX_OUTPUT_TOKENS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(8192),
-        fallback_max_output_tokens: std::env::var("CCP_FALLBACK_MAX_OUTPUT_TOKENS")
+        fallback_max_output_tokens: std::env::var("CCCTL_FALLBACK_MAX_OUTPUT_TOKENS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(8192),
@@ -176,18 +176,18 @@ fn spawn_proxy_child() -> Result<Child, String> {
     let config = build_config();
     Command::new(exe)
         .arg("proxy")
-        .env("CC_OAI_PROXY_HOST", &config.host)
-        .env("CC_OAI_PROXY_PORT", config.port.to_string())
-        .env("OPENAI_API_URL", &config.responses_url)
+        .env("CCCTL_HOST", &config.host)
+        .env("CCCTL_PORT", config.port.to_string())
+        .env("OPENAI_BASE_URL", &config.responses_url)
         .env("OPENAI_API_KEY", &config.openai_key)
-        .env("OPENAI_API_MODEL", &config.model)
-        .env("CC_OAI_PROXY_LOG_FILE", &config.log_file)
+        .env("OPENAI_MODEL_NAME", &config.model)
+        .env("CCCTL_LOG_PATH", &config.log_file)
         .env(
-            "CC_OAI_PROXY_MIN_MAX_OUTPUT_TOKENS",
+            "CCCTL_MIN_MAX_OUTPUT_TOKENS",
             config.min_max_output_tokens.to_string(),
         )
         .env(
-            "CC_OAI_PROXY_FALLBACK_MAX_OUTPUT_TOKENS",
+            "CCCTL_FALLBACK_MAX_OUTPUT_TOKENS",
             config.fallback_max_output_tokens.to_string(),
         )
         .stdin(Stdio::null())
@@ -215,7 +215,7 @@ async fn launch_claude_mode(config: Config, claude_args: Vec<String>) -> Result<
     child.env("ANTHROPIC_BASE_URL", &base_url);
     child.env(
         "ANTHROPIC_API_KEY",
-        std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| "cc_oai_proxy".to_string()),
+        std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| "ccp".to_string()),
     );
     child.env("CLAUDE_CODE_SIMPLE", "1");
     child.stdin(Stdio::inherit());
