@@ -1,6 +1,6 @@
 # Claude Code OpenAI Proxy
 
-<img width="768" height="454" alt="demo" src="https://github.com/user-attachments/assets/871f2fc9-3bff-4331-b325-c42b2b64189d" />
+<img width="480" height="284" alt="demo" src="https://github.com/user-attachments/assets/e08ca19a-3776-4431-bc2c-9398a6a8ac2f" />
 
 Use `ccctl claude` to connect Claude to an OpenAI Responses API backend.
 
