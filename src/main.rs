@@ -134,14 +134,13 @@ fn build_config() -> Config {
     Config {
         responses_url: std::env::var("OPENAI_BASE_URL").unwrap_or_default(),
         openai_key: std::env::var("OPENAI_API_KEY").unwrap_or_default(),
-        model: std::env::var("OPENAI_MODEL_NAME").unwrap_or_default(),
+        model: std::env::var("CCCTL_MODEL").unwrap_or_default(),
         host: std::env::var("CCCTL_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
         port: std::env::var("CCCTL_PORT")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(5520),
-        log_file: std::env::var("CCCTL_LOG_PATH")
-            .unwrap_or_else(|_| "ccctl.log".to_string()),
+        log_file: std::env::var("CCCTL_LOG_PATH").unwrap_or_else(|_| "ccctl.log".to_string()),
         log_level: parse_log_level(),
         min_max_output_tokens: std::env::var("CCCTL_MIN_MAX_OUTPUT_TOKENS")
             .ok()
@@ -1183,7 +1182,6 @@ mod tests {
             Bytes::new()
         );
     }
-
 
     #[tokio::test]
     async fn get_root_returns_json() {
